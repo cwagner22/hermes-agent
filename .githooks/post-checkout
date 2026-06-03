@@ -135,77 +135,7 @@ PY
     echo "[hermes-patch] Done. Restart gateways to pick up the change."
 fi
 
-# --- Patch 4: telegram.py suppress_commands extra config flag ---------------
-# suppress_commands=true skips set_my_commands calls entirely so BotFather-set
-# commands are preserved. The bot just won't overwrite them with the default
-# Hermes menu on startup.
-# Marker: self._suppress_commands
-if [ -f "$TELEGRAM_PY" ] && ! grep -q "_suppress_commands" "$TELEGRAM_PY"; then
 
-    echo "[hermes-patch] telegram.py suppress_commands flag missing; re-applying..."
-
-    python3 <<'PY'
-import pathlib
-p = pathlib.Path("gateway/platforms/telegram.py")
-src = p.read_text()
-
-# Change 1: read flag in __init__
-old1 = '        self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)'
-new1 = '''        self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
-        # suppress_commands: skip set_my_commands on startup so BotFather-set
-        # commands are preserved and the default Hermes menu is not registered.
-        self._suppress_commands: bool = self._coerce_bool_extra("suppress_commands", False)'''
-
-# Change 2: startup registration block — skip entirely when suppress_commands
-old2 = '''                from hermes_cli.commands import telegram_menu_commands
-                # Telegram allows up to 100 commands but has an undocumented
-                # payload size limit (~4KB total).  Limit to 30 core commands
-                # to stay well under the threshold while covering all categories.
-                menu_commands, hidden_count = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
-                bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]'''
-new2 = '''                from hermes_cli.commands import telegram_menu_commands
-                if self._suppress_commands:
-                    logger.info("[%s] suppress_commands=true — skipping set_my_commands, BotFather commands preserved", self.name)
-                    continue
-                # Telegram allows up to 100 commands but has an undocumented
-                # payload size limit (~4KB total).  Limit to 30 core commands
-                # to stay well under the threshold while covering all categories.
-                menu_commands, hidden_count = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
-                bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]'''
-
-# Change 3: per-forum-chat registration — skip entirely when suppress_commands
-old3 = '''                from telegram import BotCommand, BotCommandScopeChat
-                from hermes_cli.commands import telegram_menu_commands
-                menu_commands, _ = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
-                bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
-                await self._bot.set_my_commands(bot_commands, scope=BotCommandScopeChat(chat_id=chat_id))'''
-new3 = '''                if self._suppress_commands:
-                    logger.info("[%s] suppress_commands=true — skipping forum command registration for chat %s", self.name, chat_id)
-                else:
-                    from telegram import BotCommand, BotCommandScopeChat
-                    from hermes_cli.commands import telegram_menu_commands
-                    menu_commands, _ = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
-                    bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
-                    await self._bot.set_my_commands(bot_commands, scope=BotCommandScopeChat(chat_id=chat_id))'''
-
-out = src
-errors = []
-for old, new, label in [(old1, new1, "init"), (old2, new2, "startup-reg"), (old3, new3, "forum-reg")]:
-    if old in out:
-        out = out.replace(old, new, 1)
-    else:
-        errors.append(label)
-
-if errors:
-    print(f"[hermes-patch] WARNING: suppress_commands — patterns not found: {errors}; manual review needed")
-else:
-    p.write_text(out)
-    print("[hermes-patch] telegram.py suppress_commands re-applied OK")
-PY
-
-    echo "[hermes-patch] Done. Restart all gateways to pick up the change:"
-    echo "  systemctl --user restart hermes-gateway.service hermes-gateway-*.service"
-fi
 
 
 # --- Patch 5: custom bot commands — merge + passthrough -----------------------
