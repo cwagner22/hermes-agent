@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+# Post-merge hook: re-apply local patches that upstream keeps wiping out.
+# Created 2026-05-18 to persist the gateway/session.py _now() Hermes-timezone fix.
+# Extended 2026-05-25 to persist the telegram.py ignored_threads mention-bypass.
+
+set -e
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+SESSION_PY="$REPO_ROOT/gateway/session.py"
+TELEGRAM_PY="$REPO_ROOT/gateway/platforms/telegram.py"
+
+# --- Patch 1: gateway/session.py _now() Hermes-timezone fix ---------------
+if [ -f "$SESSION_PY" ] && ! grep -q "hermes_time" "$SESSION_PY"; then
+
+    echo "[hermes-patch] gateway/session.py _now() was reverted by upstream; re-applying Hermes-timezone fix..."
+
+    python3 <<'PY'
+import pathlib
+p = pathlib.Path("gateway/session.py")
+src = p.read_text()
+old = 'def _now() -> datetime:\n    """Return the current local time."""\n    return datetime.now()\n'
+new = '''def _now() -> datetime:
+    """Return the current wall-clock time in the configured Hermes timezone.
+
+    Falls back to server-local time if ``hermes_time`` is unavailable or
+    misconfigured. Returns a naive datetime so it remains comparable with
+    existing stored ``updated_at`` values (also naive).
+    """
+    try:
+        from hermes_time import now as _hermes_now
+        return _hermes_now().replace(tzinfo=None)
+    except Exception:
+        return datetime.now()
+'''
+if old in src:
+    p.write_text(src.replace(old, new))
+    print("[hermes-patch] session.py re-applied OK")
+else:
+    print("[hermes-patch] WARNING: session.py expected pattern not found; manual review needed")
+PY
+
+    echo "[hermes-patch] Done. Restart the gateway to pick up the change:"
+    echo "  systemctl --user restart hermes-gateway.service"
+fi
+
+# --- Patch 2: telegram.py ignored_threads mention bypass ------------------
+# Explicit @mention or reply-to-bot bypasses ignored_threads so a silenced
+# bot can be summoned into a topic on demand. Marker = the comment string.
+if [ -f "$TELEGRAM_PY" ] && ! grep -q "ignored_threads_allow_mention" "$TELEGRAM_PY"; then
+
+    echo "[hermes-patch] telegram.py ignored_threads mention-bypass missing; re-applying..."
+
+    python3 <<'PY'
+import pathlib
+p = pathlib.Path("gateway/platforms/telegram.py")
+src = p.read_text()
+old = '''        # Check ignored_threads first — applies to both groups and DM topics
+        if thread_id is not None:
+            try:
+                if int(thread_id) in self._telegram_ignored_threads():
+                    return False
+            except (TypeError, ValueError):
+                logger.warning("[%s] Ignoring non-numeric Telegram message_thread_id: %r", self.name, thread_id)
+
+        if not self._is_group_chat(message):'''
+new = '''        # ignored_threads check — applies to both groups and DM topics.
+        # Local patch (Chris/Henry, 2026-05-25): only explicit @mention bypasses
+        # ignored_threads so the bot can be summoned into a silenced topic on
+        # demand. Reply-to-bot is intentionally NOT a bypass — replies to old
+        # bot messages in a silenced topic would otherwise resurrect the bot.
+        # If this ever needs to be opt-in instead of always-on, add a
+        # ``telegram.ignored_threads_allow_mention: true`` config gate here.
+        if thread_id is not None:
+            try:
+                if int(thread_id) in self._telegram_ignored_threads():
+                    if not self._message_mentions_bot(message):
+                        return False
+            except (TypeError, ValueError):
+                logger.warning("[%s] Ignoring non-numeric Telegram message_thread_id: %r", self.name, thread_id)
+
+        if not self._is_group_chat(message):'''
+# Only patch the second occurrence (the _should_process_message one).
+# The first occurrence at ~line 4564 is inside _should_observe_unmentioned_group_message
+# and uses a different surrounding context — leave it alone.
+count = src.count(old)
+if count == 1:
+    p.write_text(src.replace(old, new))
+    print("[hermes-patch] telegram.py re-applied OK")
+elif count == 0:
+    print("[hermes-patch] WARNING: telegram.py expected pattern not found; manual review needed")
+else:
+    print(f"[hermes-patch] WARNING: telegram.py expected pattern matched {count} times; manual review needed")
+PY
+
+    echo "[hermes-patch] Done. Restart all gateways to pick up the change:"
+    echo "  systemctl --user restart hermes-gateway.service hermes-gateway-*.service"
+fi
+
+# --- Patch 3: gateway/run.py un-mute compaction notices on Telegram --------
+# Local patch (Chris, 2026-05-29): PR #33151 added compaction-status clauses to
+# _TELEGRAM_NOISY_STATUS_RE, silently hiding compaction notices AND failure
+# warnings from Telegram chat. Strip them so ALL compaction events are visible.
+# Keeps genuine high-frequency chatter (retrying/rate-limit/stream-drop) muted.
+RUN_PY="$REPO_ROOT/gateway/run.py"
+if [ -f "$RUN_PY" ] && grep -q "compacting" "$RUN_PY"; then
+    echo "[hermes-patch] gateway/run.py compaction notices muted by upstream; re-applying un-mute..."
+    python3 <<'PY'
+import pathlib, ast
+p = pathlib.Path("gateway/run.py")
+src = p.read_text()
+clauses = [
+    '    r"|compacting\\s+context\\s+[\u2014-]\\s+summarizing\\s+earlier\\s+conversation"\n',
+    '    r"|compression\\s+summary\\s+failed"\n',
+    '    r"|fallback\\s+context\\s+marker"\n',
+    '    r"|configured\\s+compression\\s+model\\s+.+\\s+failed"\n',
+    '    r"|no\\s+auxiliary\\s+llm\\s+provider\\s+configured"\n',
+    '    r"|auto-lowered\\s+compression\\s+threshold"\n',
+    '    r"|preflight\\s+compression"\n',
+]
+removed = 0
+out = src
+for c in clauses:
+    if c in out:
+        out = out.replace(c, "", 1); removed += 1
+try:
+    ast.parse(out)
+except SyntaxError as e:
+    print(f"[hermes-patch] WARNING: run.py would not parse after edit ({e}); skipping"); raise SystemExit(0)
+if removed:
+    p.write_text(out)
+    print(f"[hermes-patch] run.py re-applied OK ({removed} compaction clause(s) removed)")
+else:
+    print("[hermes-patch] WARNING: run.py expected clauses not found; manual review needed")
+PY
+    echo "[hermes-patch] Done. Restart gateways to pick up the change."
+fi
+
+# --- Patch 4: telegram.py suppress_commands extra config flag ---------------
+# suppress_commands=true skips set_my_commands calls entirely so BotFather-set
+# commands are preserved. The bot just won't overwrite them with the default
+# Hermes menu on startup.
+# Marker: self._suppress_commands
+if [ -f "$TELEGRAM_PY" ] && ! grep -q "_suppress_commands" "$TELEGRAM_PY"; then
+
+    echo "[hermes-patch] telegram.py suppress_commands flag missing; re-applying..."
+
+    python3 <<'PY'
+import pathlib
+p = pathlib.Path("gateway/platforms/telegram.py")
+src = p.read_text()
+
+# Change 1: read flag in __init__
+old1 = '        self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)'
+new1 = '''        self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
+        # suppress_commands: skip set_my_commands on startup so BotFather-set
+        # commands are preserved and the default Hermes menu is not registered.
+        self._suppress_commands: bool = self._coerce_bool_extra("suppress_commands", False)'''
+
+# Change 2: startup registration block — skip entirely when suppress_commands
+old2 = '''                from hermes_cli.commands import telegram_menu_commands
+                # Telegram allows up to 100 commands but has an undocumented
+                # payload size limit (~4KB total).  Limit to 30 core commands
+                # to stay well under the threshold while covering all categories.
+                menu_commands, hidden_count = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
+                bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]'''
+new2 = '''                from hermes_cli.commands import telegram_menu_commands
+                if self._suppress_commands:
+                    logger.info("[%s] suppress_commands=true — skipping set_my_commands, BotFather commands preserved", self.name)
+                    continue
+                # Telegram allows up to 100 commands but has an undocumented
+                # payload size limit (~4KB total).  Limit to 30 core commands
+                # to stay well under the threshold while covering all categories.
+                menu_commands, hidden_count = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
+                bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]'''
+
+# Change 3: per-forum-chat registration — skip entirely when suppress_commands
+old3 = '''                from telegram import BotCommand, BotCommandScopeChat
+                from hermes_cli.commands import telegram_menu_commands
+                menu_commands, _ = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
+                bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
+                await self._bot.set_my_commands(bot_commands, scope=BotCommandScopeChat(chat_id=chat_id))'''
+new3 = '''                if self._suppress_commands:
+                    logger.info("[%s] suppress_commands=true — skipping forum command registration for chat %s", self.name, chat_id)
+                else:
+                    from telegram import BotCommand, BotCommandScopeChat
+                    from hermes_cli.commands import telegram_menu_commands
+                    menu_commands, _ = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
+                    bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
+                    await self._bot.set_my_commands(bot_commands, scope=BotCommandScopeChat(chat_id=chat_id))'''
+
+out = src
+errors = []
+for old, new, label in [(old1, new1, "init"), (old2, new2, "startup-reg"), (old3, new3, "forum-reg")]:
+    if old in out:
+        out = out.replace(old, new, 1)
+    else:
+        errors.append(label)
+
+if errors:
+    print(f"[hermes-patch] WARNING: suppress_commands — patterns not found: {errors}; manual review needed")
+else:
+    p.write_text(out)
+    print("[hermes-patch] telegram.py suppress_commands re-applied OK")
+PY
+
+    echo "[hermes-patch] Done. Restart all gateways to pick up the change:"
+    echo "  systemctl --user restart hermes-gateway.service hermes-gateway-*.service"
+fi
+
+
+# --- Patch 5: custom bot commands — merge + passthrough -----------------------
+# Merges extra.custom_commands from config into setMyCommands so BotFather
+# custom commands survive Hermes startup. Also adds extra.passthrough_commands
+# support to run.py so those commands are forwarded to the LLM instead of
+# rejected as unknown.
+# Markers: custom_commands (telegram.py), passthrough_commands (run.py)
+TELEGRAM_PY="$REPO_ROOT/gateway/platforms/telegram.py"
+RUN_PY="$REPO_ROOT/gateway/run.py"
+
+if [ -f "$TELEGRAM_PY" ] && ! grep -q "custom_commands" "$TELEGRAM_PY"; then
+    echo "[hermes-patch] telegram.py custom_commands merge missing; re-applying..."
+    python3 <<'PY'
+import pathlib, ast
+p = pathlib.Path("gateway/platforms/telegram.py")
+src = p.read_text()
+
+old = '''                menu_commands, hidden_count = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
+                bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
+                # Register for all scopes independently — Telegram picks the'''
+new = '''                menu_commands, hidden_count = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
+                hermes_names = {name for name, _ in menu_commands}
+                bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
+                # Merge in any custom commands defined in config (extra.custom_commands)
+                # so BotFather-set commands survive the Hermes setMyCommands call.
+                custom_defs = self.config.extra.get("custom_commands") if self.config.extra else None
+                if custom_defs:
+                    for entry in custom_defs:
+                        cmd_name = entry.get("command", "")
+                        cmd_desc = entry.get("description", "")
+                        if cmd_name and cmd_name not in hermes_names:
+                            bot_commands.append(BotCommand(cmd_name, cmd_desc))
+                    logger.info("[%s] merged %d custom command(s) from config: %s",
+                                self.name, len(custom_defs), [e.get("command") for e in custom_defs])
+                # Register for all scopes independently — Telegram picks the'''
+
+if old in src:
+    out = src.replace(old, new, 1)
+    ast.parse(out)
+    p.write_text(out)
+    print("[hermes-patch] telegram.py custom_commands merge re-applied OK")
+else:
+    print("[hermes-patch] WARNING: custom_commands — pattern not found; manual review needed")
+PY
+fi
+
+if [ -f "$RUN_PY" ] && ! grep -q "passthrough_commands" "$RUN_PY"; then
+    echo "[hermes-patch] run.py passthrough_commands gate missing; re-applying..."
+    python3 <<'PY'
+import pathlib, ast
+p = pathlib.Path("gateway/run.py")
+src = p.read_text()
+
+old = '''                    if command.replace("_", "-") not in GATEWAY_KNOWN_COMMANDS:
+                        logger.warning(
+                            "Unrecognized slash command /%s from %s — "
+                            "replying with unknown-command notice",
+                            command,
+                            source.platform.value if source.platform else "?",
+                        )
+                        return (
+                            f"Unknown command `/{command}`. "
+                            f"Type /commands to see what\'s available, "
+                            f"or resend without the leading slash to send "
+                            f"as a regular message."
+                        )'''
+new = '''                    if command.replace("_", "-") not in GATEWAY_KNOWN_COMMANDS:
+                        # Allow commands declared as passthrough in the platform
+                        # config (extra.passthrough_commands) — forward them to
+                        # the LLM as regular prompts instead of rejecting them.
+                        adapter = self.adapters.get(source.platform) if getattr(self, "adapters", None) else None
+                        passthrough = []
+                        if adapter is not None:
+                            cfg_extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
+                            passthrough = [str(c).lstrip("/") for c in (cfg_extra.get("passthrough_commands") or [])]
+                        if command in passthrough:
+                            logger.info("passthrough command /%s — forwarding to LLM", command)
+                        else:
+                            logger.warning(
+                                "Unrecognized slash command /%s from %s — "
+                                "replying with unknown-command notice",
+                                command,
+                                source.platform.value if source.platform else "?",
+                            )
+                            return (
+                                f"Unknown command `/{command}`. "
+                                f"Type /commands to see what\'s available, "
+                                f"or resend without the leading slash to send "
+                                f"as a regular message."
+                            )'''
+
+if old in src:
+    out = src.replace(old, new, 1)
+    ast.parse(out)
+    p.write_text(out)
+    print("[hermes-patch] run.py passthrough_commands gate re-applied OK")
+else:
+    print("[hermes-patch] WARNING: passthrough_commands — pattern not found; manual review needed")
+PY
+fi
+
+
