@@ -37,6 +37,9 @@ import json
 import logging
 import os
 import re
+import contextlib
+import errno
+import fcntl
 import secrets
 import socket
 import stat
@@ -211,6 +214,75 @@ def _write_json(path: Path, data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Cross-process refresh serialization
+# ---------------------------------------------------------------------------
+#
+# Multiple Hermes gateways (main profile + per-profile services) share ONE
+# tokens file. Notion's MCP OAuth server (and most OAuth 2.1 servers) ROTATE
+# refresh tokens: each successful refresh issues a new refresh token and
+# invalidates the old one. With N gateways each holding only a per-process
+# anyio.Lock, an expiry boundary wakes all N keepalives at once; they all POST
+# the same refresh token, one rotates it, and the other N-1 get HTTP 400
+# invalid_grant because their copy is now spent. That cascades into a failed
+# interactive re-auth (headless = nobody to click) and the whole MCP server
+# going dark until hermes mcp login is run by hand.
+#
+# Fix: serialize the refresh POST across processes with an advisory fcntl.flock
+# on a per-server lock file. Whoever wins the lock checks whether the on-disk
+# token is still expired; if a sibling already rotated it while we blocked, we
+# return the freshly-written token and never POST the spent one.
+
+_REFRESH_LOCK_TIMEOUT = 30.0  # seconds to wait for a sibling's refresh
+
+
+@contextlib.contextmanager
+def _refresh_filelock(lock_path: "Path"):
+    """Best-effort cross-process advisory lock around a token refresh.
+
+    Falls back to no-op (yields without blocking) if flock is unavailable or
+    the lock can't be opened -- a missing lock must never break auth, it only
+    removes the race protection.
+    """
+    fd = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, stat.S_IRUSR | stat.S_IWUSR)
+    except OSError as exc:
+        logger.debug("refresh lock open failed (%s) -- proceeding unlocked", exc)
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        yield False
+        return
+
+    acquired = False
+    deadline = time.monotonic() + _REFRESH_LOCK_TIMEOUT
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "refresh lock %s contended >%.0fs -- proceeding unlocked",
+                        lock_path, _REFRESH_LOCK_TIMEOUT,
+                    )
+                    break
+                time.sleep(0.1)
+        yield acquired
+    finally:
+        if acquired:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+# ---------------------------------------------------------------------------
 # HermesTokenStorage -- persistent token/client-info on disk
 # ---------------------------------------------------------------------------
 
@@ -239,10 +311,10 @@ class HermesTokenStorage:
 
     # -- tokens ------------------------------------------------------------
 
-    async def get_tokens(self) -> "OAuthToken | None":
-        data = _read_json(self._tokens_path())
-        if data is None:
-            return None
+    def _lock_path(self) -> "Path":
+        return _get_token_dir() / f"{self._server_name}.refresh.lock"
+
+    def _parse_tokens(self, data: dict) -> "OAuthToken | None":
         # Hermes records an absolute wall-clock ``expires_at`` alongside the
         # SDK's serialized token (see ``set_tokens``). On read we rewrite
         # ``expires_in`` to the remaining seconds so the SDK's downstream
@@ -277,6 +349,42 @@ class HermesTokenStorage:
         except (ValueError, TypeError, KeyError) as exc:
             logger.warning("Corrupt tokens at %s -- ignoring: %s", self._tokens_path(), exc)
             return None
+
+    async def get_tokens(self) -> "OAuthToken | None":
+        data = _read_json(self._tokens_path())
+        if data is None:
+            return None
+        token = self._parse_tokens(data)
+        if token is None:
+            return None
+
+        # When the token is still valid skip the lock -- this path is hit on
+        # every request and must stay cheap.
+        if (token.expires_in or 0) > 0 or not getattr(token, "refresh_token", None):
+            return token
+
+        # Token is expired and refreshable. Acquire the cross-process flock so
+        # only ONE gateway POSTs the rotating refresh token. While we block, a
+        # sibling may rotate it; re-read under the lock and use the fresh token
+        # so we never replay a spent one.
+        with _refresh_filelock(self._lock_path()) as acquired:
+            if not acquired:
+                # Couldn't serialize (contended past timeout / no flock).
+                # Fall back to the original behaviour: let the SDK try.
+                return token
+            fresh = _read_json(self._tokens_path())
+            if fresh is not None:
+                refreshed = self._parse_tokens(fresh)
+                if refreshed is not None and (refreshed.expires_in or 0) > 0:
+                    logger.info(
+                        "MCP OAuth '%s': sibling already rotated token while we "
+                        "waited -- using fresh token, skipping refresh",
+                        self._server_name,
+                    )
+                    return refreshed
+                token = refreshed or token
+            # Still expired -- we are the designated refresher.
+            return token
 
     async def set_tokens(self, tokens: "OAuthToken") -> None:
         payload = tokens.model_dump(mode="json", exclude_none=True)
