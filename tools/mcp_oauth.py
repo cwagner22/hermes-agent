@@ -234,6 +234,37 @@ def _write_json(path: Path, data: dict) -> None:
 
 _REFRESH_LOCK_TIMEOUT = 30.0  # seconds to wait for a sibling's refresh
 
+# Follower wait: how long a non-leader profile will poll the shared token file
+# for the leader to rotate it before giving up and attempting a self-refresh.
+# Kept under the SDK/keepalive timeout so a stuck leader doesn't wedge followers.
+_FOLLOWER_WAIT_TIMEOUT = 20.0
+_FOLLOWER_POLL_INTERVAL = 0.25
+
+
+def _is_refresh_leader() -> bool:
+    """True if this process is the designated token-refresh leader.
+
+    Multiple gateways share one OAuth token file (per-profile mcp-tokens dirs
+    are symlinked to the root ~/.hermes/mcp-tokens on this install). Notion
+    rotates refresh tokens, so only ONE process may POST a refresh per expiry
+    boundary -- otherwise the losers replay a spent token and get HTTP 400.
+
+    The leader is the process whose HERMES_HOME is the ROOT (~/.hermes), i.e.
+    the default profile. Sub-profiles (HERMES_HOME under .../profiles/<name>)
+    are followers: they never refresh, they wait for the leader's rotated token.
+
+    Fail-open: if we can't determine the layout, assume leader so a
+    misconfigured box still refreshes rather than wedging forever.
+    """
+    try:
+        env_home = os.environ.get("HERMES_HOME", "").strip()
+        if not env_home:
+            return True
+        return Path(env_home).resolve().parent.name != "profiles"
+    except OSError:
+        return True
+
+
 
 @contextlib.contextmanager
 def _refresh_filelock(lock_path: "Path"):
@@ -363,7 +394,35 @@ class HermesTokenStorage:
         if (token.expires_in or 0) > 0 or not getattr(token, "refresh_token", None):
             return token
 
-        # Token is expired and refreshable. Acquire the cross-process flock so
+        # Token is expired and refreshable. Leader/follower split:
+        #
+        #   FOLLOWER (sub-profile): must NOT POST a refresh -- it would replay
+        #   the shared rotating refresh token and get HTTP 400. Poll the shared
+        #   file for the leader to rotate it, then use the fresh token. Falls
+        #   through to self-refresh only if the leader never delivers (e.g. down).
+        if not _is_refresh_leader():
+            deadline = time.monotonic() + _FOLLOWER_WAIT_TIMEOUT
+            while time.monotonic() < deadline:
+                fresh = _read_json(self._tokens_path())
+                if fresh is not None:
+                    refreshed = self._parse_tokens(fresh)
+                    if refreshed is not None and (refreshed.expires_in or 0) > 0:
+                        logger.debug(
+                            "MCP OAuth '%s': follower picked up leader-rotated "
+                            "token, skipping own refresh",
+                            self._server_name,
+                        )
+                        return refreshed
+                time.sleep(_FOLLOWER_POLL_INTERVAL)
+            logger.warning(
+                "MCP OAuth '%s': follower waited %.0fs for leader to rotate "
+                "token but it stayed expired -- attempting self-refresh as "
+                "last resort (leader may be down)",
+                self._server_name, _FOLLOWER_WAIT_TIMEOUT,
+            )
+            # fall through to flock path below (last-resort self-refresh)
+
+        # LEADER (or follower last-resort): acquire the cross-process flock so
         # only ONE gateway POSTs the rotating refresh token. While we block, a
         # sibling may rotate it; re-read under the lock and use the fresh token
         # so we never replay a spent one.
